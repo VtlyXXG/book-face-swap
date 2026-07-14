@@ -12,14 +12,6 @@ pipeline.py — единая точка входа: иллюстрация + ф�
 Запуск:
   python pipeline.py --image data/illustrations/spread_01.png \
                      --client data/clients/ivan.jpg --seeds 5
-
-Полезные флаги:
-  --seeds N          сколько вариантов сгенерировать (default 5)
-  --likeness         приоритет сходства с клиентом над стилем
-  --face-index K     на сцене несколько лиц — заменить только K-е
-  --force-detect / --force-mask   пересчитать кэш шагов 0-1
-  --no-bg-fill       выключить заливку нимба
-  остальные флаги тюнинга совпадают с output_inpainting.py
 """
 
 from __future__ import annotations
@@ -47,8 +39,7 @@ OUTPUTS_DIR = PROJECT_ROOT / "data" / "outputs"
 
 def ensure_detection(image_path: Path, threshold: float = 0.5,
                      force: bool = False) -> dict:
-    """Детекция лица персонажа. Если JSON уже посчитан — кэш (заготовки
-    статичны, шаг офлайн-подготовки книги). Тяжёлые импорты ленивые."""
+    """Детекция лица персонажа. Если JSON уже посчитан — кэш."""
     json_path = DETECTIONS_DIR / f"{image_path.stem}.json"
     if json_path.exists() and not force:
         with open(json_path, encoding="utf-8") as f:
@@ -81,11 +72,7 @@ def ensure_detection(image_path: Path, threshold: float = 0.5,
 
 def ensure_mask(image_path: Path, force: bool = False,
                 face_index: int | None = None) -> Path:
-    """Маска лицо+волосы персонажа. Кэшируется.
-
-    face_index: замаскировать только одно лицо (индекс по убыванию score
-    детектора). None = все лица на сцене.
-    """
+    """Маска лицо+волосы персонажа. Кэшируется."""
     stem = image_path.stem
     mask_path = MASKS_DIR / f"{stem}_mask.png"
     if mask_path.exists() and not force:
@@ -135,7 +122,6 @@ def ensure_mask(image_path: Path, force: bool = False,
     im.draw_visualization(image_bgr, combined, boxes, points_by_face,
                           MASKS_DIR / f"{stem}_vis.jpg")
 
-    # освобождаем VRAM под SDXL
     del predictor
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -147,12 +133,8 @@ def ensure_mask(image_path: Path, force: bool = False,
 # ==================== ШАГИ 2-5: КОЛЛАЖ + ИНПЕЙНТ + НИМБ =======================
 
 def generate(image_path: Path, client_path: Path, cfg,
-             paste_face: bool = False) -> dict:
-    """Генерация cfg.seeds кандидатов. Возвращает dict с путями и метриками.
-
-    Логика идентична output_inpainting.py; face-parsing грузится один раз
-    и переиспользуется коллажом и заливкой нимба.
-    """
+             paste_face: bool = False, pipe=None, parser=None) -> dict:
+    """Генерация cfg.seeds кандидатов. Поддерживает инжект готовых pipe и parser."""
     import torch
     from PIL import Image
     from hair_collage import (build_face_parser, client_hair_and_face_masks,
@@ -183,7 +165,8 @@ def generate(image_path: Path, client_path: Path, cfg,
     # --- шаг 2: коллаж ---
     print("[2] Коллаж волос клиента ...")
     with quiet():
-        parser = build_face_parser(device)
+        if parser is None:
+            parser = build_face_parser(device)
         hair_m, face_m = client_hair_and_face_masks(client_bgr, parser)
         char_hair, _cf, ok = character_hair_face_on_illustration(
             illus_bgr, mask_full, parser)
@@ -223,8 +206,10 @@ def generate(image_path: Path, client_path: Path, cfg,
     pil_mask = Image.fromarray(mask_gs)
 
     # --- шаг 3: модели ---
-    print("[3] Загрузка моделей (SDXL + ControlNet + FaceID) ...")
-    pipe = inp.build_pipeline(device, cfg)
+    if pipe is None:
+        print("[3] Загрузка моделей (SDXL + ControlNet + FaceID) ...")
+        pipe = inp.build_pipeline(device, cfg)
+    
     pipe.set_ip_adapter_scale(cfg.ip_scale)
     if cfg.faceid_version == "plusv2":
         inp.setup_faceid_plusv2(pipe, client_bgr, cface, device, dtype)
@@ -235,7 +220,7 @@ def generate(image_path: Path, client_path: Path, cfg,
         bg_filler = BackgroundFiller(device, pipe=pipe, gen_size=cfg.gen_size,
                                      control_scale=cfg.control_scale,
                                      restore_ip_scale=cfg.ip_scale,
-                                     parser=parser)   # переиспользуем парсер
+                                     parser=parser)
         bg_filler.set_ref_embed_shape(tuple(id_embeds.shape))
 
     out_dir = OUTPUTS_DIR / f"{stem}__{client_path.stem}"
@@ -346,9 +331,8 @@ def run_pipeline(image: str | Path, client: str | Path, *,
                  face_index: int | None = None,
                  force_detect: bool = False, force_mask: bool = False,
                  threshold: float = 0.5, paste_face: bool = False,
-                 cfg_overrides: dict | None = None) -> dict:
-    """Полный прогон: детекция -> маска -> коллаж -> инпейнт -> нимб -> выбор.
-    Возвращает result.json-словарь (пути кандидатов в поле "candidates")."""
+                 cfg_overrides: dict | None = None, pipe=None, parser=None) -> dict:
+    """Полный прогон с возможностью проброса pipe и parser наружу."""
     image_path, client_path = Path(image), Path(client)
     for p, what in [(image_path, "иллюстрация"), (client_path, "фото клиента")]:
         if not p.exists():
@@ -371,39 +355,29 @@ def run_pipeline(image: str | Path, client: str | Path, *,
     t_start = time.time()
     ensure_detection(image_path, threshold=threshold, force=force_detect)
     ensure_mask(image_path, force=force_mask, face_index=face_index)
-    result = generate(image_path, client_path, cfg, paste_face=paste_face)
+    
+    # Передаем pipe и parser дальше в generate
+    result = generate(image_path, client_path, cfg, paste_face=paste_face, pipe=pipe, parser=parser)
     result["total_seconds"] = round(time.time() - t_start, 1)
-    print(f"Полное время: {result['total_seconds']} c "
-          f"(включая загрузку моделей)")
+    print(f"Полное время: {result['total_seconds']} c")
     return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="End-to-end пайплайн: иллюстрация + фото клиента -> "
-                    "N кандидатов с лицом клиента.")
+        description="End-to-end пайплайн: иллюстрация + фото клиента -> N кандидатов.")
     parser.add_argument("--image", required=True, help="Иллюстрация-заготовка.")
     parser.add_argument("--client", required=True, help="Фото клиента.")
-    parser.add_argument("--seeds", type=int, default=None,
-                        help="Сколько вариантов сгенерировать (default 5).")
-    parser.add_argument("--likeness", action="store_true",
-                        help="Приоритет сходства с клиентом над стилем.")
-    parser.add_argument("--face-index", type=int, default=None,
-                        help="На сцене несколько лиц — заменить только это "
-                             "(индекс из детекции). По умолчанию все.")
-    parser.add_argument("--threshold", type=float, default=0.5,
-                        help="Порог RetinaFace на иллюстрации.")
-    parser.add_argument("--force-detect", action="store_true",
-                        help="Пересчитать детекцию, игнорируя кэш.")
-    parser.add_argument("--force-mask", action="store_true",
-                        help="Пересчитать маску SAM2, игнорируя кэш.")
-    parser.add_argument("--no-bg-fill", action="store_true",
-                        help="Отключить заливку нимба.")
-    parser.add_argument("--paste-face", action="store_true",
-                        help="Вклеивать в коллаж и лицо клиента (эксперимент).")
+    parser.add_argument("--seeds", type=int, default=None)
+    parser.add_argument("--likeness", action="store_true")
+    parser.add_argument("--face-index", type=int, default=None)
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--force-detect", action="store_true")
+    parser.add_argument("--force-mask", action="store_true")
+    parser.add_argument("--no-bg-fill", action="store_true")
+    parser.add_argument("--paste-face", action="store_true")
     parser.add_argument("--faceid", default=None, choices=["v1", "plusv2"])
-    parser.add_argument("--base-model", default=None,
-                        help="Другой SDXL-чекпоинт (HF id или путь).")
+    parser.add_argument("--base-model", default=None)
     parser.add_argument("--ip-scale", type=float, default=None)
     parser.add_argument("--faceid-lora-scale", type=float, default=None)
     parser.add_argument("--control-scale", type=float, default=None)
@@ -411,8 +385,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--guidance", type=float, default=None)
     parser.add_argument("--paste-dilate", type=int, default=None)
-    parser.add_argument("--base-seed", type=int, default=None,
-                        help="Стартовый seed (default 42).")
+    parser.add_argument("--base-seed", type=int, default=None)
     args = parser.parse_args()
 
     cfg_overrides = {}
